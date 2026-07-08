@@ -27,10 +27,15 @@ Two modes:
 
 What gets spoken on stop (KITTEN_STOP_MODE=summary, the default):
   - message fits in KITTEN_MAX_CHARS -> read the whole thing
-  - longer -> ask the tool the message came from for a 1-2 sentence summary
-    of the FULL message (a Copilot session summarizes with `copilot -p`, a
-    Gemini session with `gemini -p`, ...), trying one other installed CLI if
-    the native one fails, then falling back to the opening sentences
+  - longer -> summarize the FULL message, two ways (chosen at install time,
+    stored in config.json next to this script):
+      local  -> a quantized DistilBART ONNX model on this machine (~230 MB,
+                1-2s on CPU, nothing leaves the machine, works offline)
+      native -> ask the tool the message came from (a Copilot session
+                summarizes with `copilot -p`, a Gemini session with
+                `gemini -p`, ...), trying one other installed CLI if the
+                native one fails
+    Either way a failure falls back to speaking the opening sentences.
   - turn ended on a tool call with no final text -> speak the chime instead
     of hunting backwards for stale mid-turn text
 
@@ -46,7 +51,11 @@ Tuning (all optional env vars):
   KITTEN_CHIME          chime phrase (default: "Done.")
   KITTEN_NOTIFY         on | off  (default: on)
   KITTEN_MAX_CHARS      read-it-all threshold / spoken cap (default: 400)
-  KITTEN_SUMMARY_MODEL  model passed to `claude -p` (default: haiku)
+  KITTEN_SUMMARIZER     local | native - overrides the install-time choice
+  KITTEN_LOCAL_MODEL    HF repo of the local ONNX summarizer
+                        (default: Xenova/distilbart-cnn-6-6)
+  KITTEN_SUMMARY_MODEL  model passed to `claude -p` in native mode
+                        (default: haiku)
   KITTEN_DISABLE        set to 1 to silence the hook entirely; also set on
                         nested `claude -p`/`copilot -p` calls so summarizing
                         a message can't recursively trigger this hook
@@ -69,6 +78,25 @@ CHIME = os.environ.get("KITTEN_CHIME", "Done.")
 NOTIFY = os.environ.get("KITTEN_NOTIFY", "on").lower()
 MAX_CHARS = int(os.environ.get("KITTEN_MAX_CHARS", "400"))
 SUMMARY_MODEL = os.environ.get("KITTEN_SUMMARY_MODEL", "haiku")
+
+
+def _config():
+    """Install-time choices written by install.sh next to this script."""
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+CONFIG = _config()
+# "local" = on-device ONNX model, never calls any agent CLI; "native" = the
+# CLI the message came from. Env var overrides the installed choice.
+SUMMARIZER = os.environ.get(
+    "KITTEN_SUMMARIZER", CONFIG.get("summarizer", "native")).lower()
+LOCAL_MODEL = os.environ.get(
+    "KITTEN_LOCAL_MODEL",
+    CONFIG.get("local_model", "Xenova/distilbart-cnn-6-6"))
 
 STOP_EVENTS = {"Stop", "agentStop"}
 NOTIFY_EVENTS = {"Notification", "notification"}
@@ -311,6 +339,81 @@ def summarize_with_llm(text, source=None):
     return None
 
 
+def _dedupe_sentences(text):
+    """Drop near-duplicate sentences (small seq2seq models love repeating)."""
+    kept, seen_words = [], []
+    for s in re.split(r"(?<=[.!?])\s+", text):
+        words = set(re.findall(r"[a-z']+", s.lower()))
+        if not words:
+            continue
+        if any(len(words & prev) / len(words) > 0.6 for prev in seen_words):
+            continue
+        kept.append(s.strip())
+        seen_words.append(words)
+    return " ".join(kept)
+
+
+def _hf_file(repo, filename):
+    from huggingface_hub import hf_hub_download
+    try:  # prefer the cache so summarization works fully offline
+        return hf_hub_download(repo, filename, local_files_only=True)
+    except Exception:
+        return hf_hub_download(repo, filename)
+
+
+def summarize_local(text, min_new=20, max_new=90):
+    """Fully on-device summary via a quantized DistilBART ONNX model.
+
+    Greedy seq2seq decode with no-repeat-trigram blocking, then sentence
+    dedupe. ~230 MB of model, 1-2s on CPU, nothing leaves the machine.
+    Returns None on any failure (caller falls back to truncation, never to
+    a cloud CLI - "local" must mean local).
+    """
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3
+        enc = ort.InferenceSession(
+            _hf_file(LOCAL_MODEL, "onnx/encoder_model_quantized.onnx"), opts,
+            providers=["CPUExecutionProvider"])
+        dec = ort.InferenceSession(
+            _hf_file(LOCAL_MODEL, "onnx/decoder_model_quantized.onnx"), opts,
+            providers=["CPUExecutionProvider"])
+        tok = Tokenizer.from_file(_hf_file(LOCAL_MODEL, "tokenizer.json"))
+
+        ids = tok.encode(text[:4000]).ids[:512]
+        input_ids = np.array([ids], dtype=np.int64)
+        attn = np.ones_like(input_ids)
+        hidden = enc.run(None, {"input_ids": input_ids,
+                                "attention_mask": attn})[0]
+        out = [2, 0]  # BART: decoder_start (eos), then bos
+        for step in range(max_new):
+            logits = dec.run(None, {
+                "input_ids": np.array([out], dtype=np.int64),
+                "encoder_hidden_states": hidden,
+                "encoder_attention_mask": attn,
+            })[0][0, -1]
+            if step < min_new:
+                logits[2] = -1e9  # block EOS: force a fuller summary
+            if len(out) >= 2:  # no-repeat-trigram blocking
+                last2 = (out[-2], out[-1])
+                for j in range(len(out) - 2):
+                    if (out[j], out[j + 1]) == last2:
+                        logits[out[j + 2]] = -1e9
+            nxt = int(np.argmax(logits))
+            if nxt == 2:
+                break
+            out.append(nxt)
+        raw = tok.decode(out[2:], skip_special_tokens=True)
+        return _dedupe_sentences(clean_for_speech(raw)) or None
+    except Exception as e:
+        log(f"local summarizer error: {e}")
+        return None
+
+
 def stop_text(transcript_path, source=None):
     """Decide what a stop event should say. None means stay silent."""
     if not transcript_path:
@@ -335,7 +438,10 @@ def render_stop_text(msg, source=None):
     text = clean_for_speech(msg)
     if STOP_MODE == "full" or len(text) <= MAX_CHARS:
         return text
-    summary = summarize_with_llm(msg, source)
+    if SUMMARIZER == "local":
+        summary = summarize_local(msg)
+    else:
+        summary = summarize_with_llm(msg, source)
     return truncate_sentences(summary if summary else text)
 
 

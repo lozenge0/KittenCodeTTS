@@ -53,16 +53,20 @@ have() { eval "echo \$HAVE_$1"; }
 
 # --- flags -----------------------------------------------------------------
 for t in $TOOLS; do eval "WANT_$t=0 HAVE_$t=0"; done
-ASKED=0 ALL=0 NO_TEST=0
+ASKED=0 ALL=0 NO_TEST=0 SUMMARIZER="" EXPECT_SUM=0
 for a in "$@"; do
+  if [ "$EXPECT_SUM" = 1 ]; then SUMMARIZER="$a"; EXPECT_SUM=0; continue; fi
   case "$a" in
     --claude|--copilot|--codex|--gemini|--opencode) eval "WANT_${a#--}=1"; ASKED=1 ;;
     --both)    WANT_claude=1; WANT_copilot=1; ASKED=1 ;;
     --all)     ALL=1; ASKED=1 ;;
     --no-test) NO_TEST=1 ;;
-    *) die "unknown flag: $a (use --claude, --copilot, --codex, --gemini, --opencode, --all, --no-test)" ;;
+    --summarizer)   EXPECT_SUM=1 ;;
+    --summarizer=*) SUMMARIZER="${a#*=}" ;;
+    *) die "unknown flag: $a (use --claude, --copilot, --codex, --gemini, --opencode, --all, --summarizer local|native, --no-test)" ;;
   esac
 done
+case "$SUMMARIZER" in ""|local|native) ;; *) die "--summarizer must be 'local' or 'native'" ;; esac
 
 # --- preflight ---------------------------------------------------------------
 case "$(uname)" in
@@ -120,13 +124,27 @@ for t in $TOOLS; do
   [ "$(want "$t")" = 1 ] && [ "$(have "$t")" = 0 ] && die "--$t requested but '$t' not found on PATH"
 done
 
+# --- choose how long replies get summarized -----------------------------------
+if [ -z "$SUMMARIZER" ]; then
+  say "How should long replies be summarized before being spoken?"
+  note "[1] locally - small on-device model, ~230 MB one-time download, fully offline"
+  note "[2] with the coding tool itself (claude -p, copilot -p, ...) - no download, uses your plan's tokens"
+  printf 'Choice [1] '
+  read -r spick < /dev/tty || spick=1
+  case "${spick:-1}" in
+    1|"") SUMMARIZER=local ;;
+    2)    SUMMARIZER=native ;;
+    *) die "unrecognized choice: $spick" ;;
+  esac
+fi
+
 # --- install the engine --------------------------------------------------------
 say "Setting up $KITTEN_HOME (self-contained venv, ~300 MB)"
 mkdir -p "$KITTEN_HOME"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
 say "Installing the KittenTTS engine (pinned to KittenML/KittenTTS@${ENGINE_REF:0:7})"
-"$VENV/bin/pip" install --quiet "$ENGINE_URL"
+"$VENV/bin/pip" install --quiet "$ENGINE_URL" tokenizers
 
 # The hook script: next to this installer in a checkout, downloaded otherwise.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
@@ -140,6 +158,19 @@ fi
 say "Downloading the voice model (~80 MB, one-time, cached by Hugging Face)"
 "$PY" -c "from kittentts import KittenTTS; import os; KittenTTS(os.environ.get('KITTEN_MODEL','KittenML/kitten-tts-mini-0.8'))" \
   || note "model download failed (offline?) - it will retry on first use"
+
+printf '{\n  "summarizer": "%s"\n}\n' "$SUMMARIZER" > "$KITTEN_HOME/config.json"
+if [ "$SUMMARIZER" = "local" ]; then
+  say "Downloading the local summarizer model (~230 MB, one-time, cached by Hugging Face)"
+  "$PY" - <<'PYEOF' || note "summarizer download failed (offline?) - it will retry on first use"
+import os
+from huggingface_hub import hf_hub_download
+repo = os.environ.get("KITTEN_LOCAL_MODEL", "Xenova/distilbart-cnn-6-6")
+for f in ("onnx/encoder_model_quantized.onnx",
+          "onnx/decoder_model_quantized.onnx", "tokenizer.json"):
+    hf_hub_download(repo, f)
+PYEOF
+fi
 
 # Merge our hook entries into a Claude-style settings.json without touching
 # anything else. Used for Claude Code and Gemini CLI (same schema).
@@ -314,5 +345,9 @@ say "Done. Final steps:"
 [ "$WANT_codex" = 1 ]    && note "Codex CLI: no restart needed; notify fires on each completed turn."
 [ "$WANT_gemini" = 1 ]   && note "Gemini CLI: restart any running session to load the new hooks."
 [ "$WANT_opencode" = 1 ] && note "OpenCode: restart it to load the plugin."
-note "Long replies are summarized by the same CLI that produced them; without one, the opening sentences are read."
+if [ "$SUMMARIZER" = "local" ]; then
+  note "Long replies are summarized on-device; nothing leaves your machine. (Switch: KITTEN_SUMMARIZER=native)"
+else
+  note "Long replies are summarized by the same CLI that produced them. (Switch: KITTEN_SUMMARIZER=local)"
+fi
 note "Tune with env vars (KITTEN_VOICE, KITTEN_STOP_MODE, ...) - see the README."

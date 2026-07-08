@@ -38,9 +38,12 @@ curl -fsSL https://raw.githubusercontent.com/lozenge0/KittenCodeTTS/main/install
 
 or from a checkout: `bash install.sh`
 
-The installer detects which CLIs you have, asks which to wire up
-(`--claude`, `--copilot`, `--codex`, `--gemini`, `--opencode`, or `--all`
-skip the menu; `--no-test` skips the spoken confirmation), then:
+The installer detects which CLIs you have, asks which to wire up, and asks
+whether long replies should be summarized **locally** (small on-device
+model, ~230 MB, fully offline — the default) or **by the coding tool
+itself**. Flags skip the questions: `--claude`, `--copilot`, `--codex`,
+`--gemini`, `--opencode`, or `--all` for targets; `--summarizer
+local|native`; `--no-test` skips the spoken confirmation. Then it:
 
 1. builds a self-contained engine in `~/.kitten-voice/` (venv ~300 MB; the
    voice model, ~80 MB, is fetched from Hugging Face and cached),
@@ -89,15 +92,22 @@ a known-good commit (override with `KITTEN_ENGINE_REF=<sha>`).
 ## Privacy & cost — read this once
 
 - Speech synthesis is fully local. Nothing is sent anywhere to make audio.
-- **Long replies are summarized by the same tool that produced them**: a
-  Claude Code reply is condensed by `claude -p` (a small Haiku call), a
-  Copilot reply by `copilot -p` (a premium request), Gemini by `gemini -p`,
-  Codex by `codex exec` (read-only sandbox), OpenCode by `opencode run` —
-  so nothing leaves the AI tool you were already talking to, and billing
-  stays put. If the native tool fails, one other installed CLI is tried;
-  if none work, the opening sentences are read instead — no network
-  involved. Set `KITTEN_MAX_CHARS` higher to summarize less often, or
-  `KITTEN_STOP_MODE=chime` to never send anything.
+- **Long replies are summarized — you pick how at install time:**
+  - **locally** (the default): a quantized DistilBART ONNX model (~230 MB
+    one-time download) condenses the message on your CPU in 1–2 seconds.
+    Fully offline, zero tokens, nothing leaves your machine — ever.
+  - **with your coding tool**: the same CLI that produced the reply
+    condenses it — `claude -p` (a small Haiku call), `copilot -p` (a
+    premium request), `gemini -p`, `codex exec` (read-only sandbox), or
+    `opencode run`. Nothing leaves the tool you were already talking to,
+    and billing stays put. If the native tool fails, one other installed
+    CLI is tried.
+
+  Either way, failures fall back to reading the opening sentences — and a
+  `local` install never contacts any CLI. Switch anytime with
+  `KITTEN_SUMMARIZER=local|native` (or re-run the installer). Set
+  `KITTEN_MAX_CHARS` higher to summarize less often, or
+  `KITTEN_STOP_MODE=chime` to never speak message content at all.
 - The log file records a snippet of each spoken line for debugging. It stays
   on your machine; delete it whenever.
 
@@ -115,7 +125,9 @@ top of `~/.kitten-voice/kitten_voice.py`.
 | `KITTEN_CHIME` | `Done.` | Phrase for `chime` mode and for turns that end on a tool call |
 | `KITTEN_NOTIFY` | `on` | `off` disables notification speech |
 | `KITTEN_MAX_CHARS` | `400` | Messages up to this long are read whole; longer ones get summarized |
-| `KITTEN_SUMMARY_MODEL` | `haiku` | Model passed to `claude -p` for summaries |
+| `KITTEN_SUMMARIZER` | install-time choice | `local` (on-device ONNX model) · `native` (the session's own CLI) |
+| `KITTEN_LOCAL_MODEL` | `Xenova/distilbart-cnn-6-6` | HF repo of the local ONNX summarizer |
+| `KITTEN_SUMMARY_MODEL` | `haiku` | Model passed to `claude -p` in native mode |
 | `KITTEN_DISABLE` | unset | `1` silences the hook entirely (also set internally on nested summarizer calls so they can't re-trigger the hook) |
 
 ## Manual test

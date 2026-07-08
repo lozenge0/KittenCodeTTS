@@ -168,5 +168,45 @@ check("summarize-gemini", (cmd, stdin), (["/x/gemini", "-p", "P"], "B"))
 cmd, stdin = kv._summarizer_invocation("opencode", "/x/opencode", "P", "B")
 check("summarize-opencode", (cmd, stdin), (["/x/opencode", "run", "P\n\nB"], ""))
 
+# ---- local (ONNX) summarizer -------------------------------------------------
+
+check("dedupe-drops-repeats",
+      kv._dedupe_sentences("The fix works. The fix works. Tests pass now."),
+      "The fix works. Tests pass now.")
+check("dedupe-keeps-distinct",
+      kv._dedupe_sentences("Build failed. The cause is a missing key."),
+      "Build failed. The cause is a missing key.")
+
+# env var overrides the install-time summarizer choice
+os.environ["KITTEN_SUMMARIZER"] = "local"
+spec2 = importlib.util.spec_from_file_location(
+    "kv2", os.path.join(ROOT, "kitten_voice.py"))
+kv2 = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(kv2)
+check("summarizer-env-override", kv2.SUMMARIZER, "local")
+del os.environ["KITTEN_SUMMARIZER"]
+
+# full local summarization - only when deps + cached model are present
+# (CI runs stdlib-only python, so this skips there)
+try:
+    import onnxruntime, tokenizers, numpy  # noqa: F401
+    kv._hf_file(kv.LOCAL_MODEL, "tokenizer.json")
+    can_local = True
+except Exception:
+    can_local = False
+if can_local:
+    long_msg = ("The deployment pipeline is fixed. The staging config was "
+                "pointing at a rotated secret, so the new pods crashed on "
+                "startup with a missing PAYMENTS_API_KEY. I updated the helm "
+                "values to reference the new secret name, redeployed, and "
+                "watched the canary go green. All health checks pass and "
+                "traffic is being served normally again.")
+    s = kv.summarize_local(long_msg)
+    check("local-summary-nonempty", bool(s and len(s) > 20), True)
+    check("local-summary-shorter", len(s) < len(long_msg), True)
+    print("    local summary:", s)
+else:
+    print("SKIP local-summary (deps or model not present)")
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
