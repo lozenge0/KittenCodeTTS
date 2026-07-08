@@ -133,5 +133,24 @@ check("short-read-all-cleaned", kv.stop_text(p), "It works now. See settings.jso
 
 check("stop-text-no-path-silent", kv.stop_text(None), None)
 
+# ---- inline-message path (Codex / Gemini / OpenCode) --------------------------
+
+check("render-empty-chimes", kv.render_stop_text(""), kv.CHIME)
+check("render-short-cleaned",
+      kv.render_stop_text("Renamed `foo` to **bar**. All tests pass."),
+      "Renamed foo to bar. All tests pass.")
+
+# codex payload: argv JSON with the final message inline
+codex_payload = json.dumps({
+    "type": "agent-turn-complete",
+    "turn-id": "1",
+    "input-messages": ["do the thing"],
+    "last-assistant-message": "The thing is done.",
+})
+check("codex-payload-parses",
+      json.loads(codex_payload).get("last-assistant-message"), "The thing is done.")
+check("codex-argv-detected",
+      codex_payload.startswith("{"), True)
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

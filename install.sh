@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # KittenCodeTTS — one-shot installer.
 #
-# Gives Claude Code and/or GitHub Copilot CLI a spoken voice: notifications
-# and end-of-turn messages are read aloud by a tiny local TTS model.
+# Gives your terminal AI coding agents a spoken voice: notifications and
+# end-of-turn messages are read aloud by a tiny local TTS model.
+#
+# Supported: Claude Code, GitHub Copilot CLI, OpenAI Codex CLI, Gemini CLI,
+# OpenCode.
 #
 #   from a checkout:   bash install.sh
 #   from anywhere:     curl -fsSL https://raw.githubusercontent.com/lozenge0/KittenCodeTTS/main/install.sh | bash
 #
-# Flags: --claude --copilot --both   preselect targets (skips the menu)
-#        --no-test                   skip the spoken confirmation at the end
+# Flags: --claude --copilot --codex --gemini --opencode   preselect targets
+#        --all        wire up every detected CLI (skips the menu)
+#        --both       shorthand for --claude --copilot
+#        --no-test    skip the spoken confirmation at the end
 #
 # Everything lands in ~/.kitten-voice (script, venv, log). macOS and Linux.
 set -euo pipefail
@@ -31,15 +36,31 @@ say()  { printf '\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# macOS ships bash 3.2 (no associative arrays), so tool selection uses
+# eval-built scalar variables: WANT_claude, HAVE_codex, ...
+TOOLS="claude copilot codex gemini opencode"
+tool_desc() {
+  case "$1" in
+    claude) echo "Claude Code" ;;
+    copilot) echo "GitHub Copilot CLI" ;;
+    codex) echo "OpenAI Codex CLI" ;;
+    gemini) echo "Gemini CLI" ;;
+    opencode) echo "OpenCode" ;;
+  esac
+}
+want() { eval "echo \$WANT_$1"; }
+have() { eval "echo \$HAVE_$1"; }
+
 # --- flags -----------------------------------------------------------------
-WANT_CLAUDE=0 WANT_COPILOT=0 ASKED=0 NO_TEST=0
+for t in $TOOLS; do eval "WANT_$t=0 HAVE_$t=0"; done
+ASKED=0 ALL=0 NO_TEST=0
 for a in "$@"; do
   case "$a" in
-    --claude)  WANT_CLAUDE=1; ASKED=1 ;;
-    --copilot) WANT_COPILOT=1; ASKED=1 ;;
-    --both)    WANT_CLAUDE=1; WANT_COPILOT=1; ASKED=1 ;;
+    --claude|--copilot|--codex|--gemini|--opencode) eval "WANT_${a#--}=1"; ASKED=1 ;;
+    --both)    WANT_claude=1; WANT_copilot=1; ASKED=1 ;;
+    --all)     ALL=1; ASKED=1 ;;
     --no-test) NO_TEST=1 ;;
-    *) die "unknown flag: $a (use --claude, --copilot, --both, --no-test)" ;;
+    *) die "unknown flag: $a (use --claude, --copilot, --codex, --gemini, --opencode, --all, --no-test)" ;;
   esac
 done
 
@@ -59,32 +80,45 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
 # dies silently past them; site-packages adds ~75 chars to $HOME.
 [ ${#HOME} -le 80 ] || die "\$HOME is too deep for espeak-ng's path buffer (${#HOME} chars, max ~80)"
 
-HAVE_CLAUDE=0 HAVE_COPILOT=0
-command -v claude  >/dev/null 2>&1 && HAVE_CLAUDE=1
-command -v copilot >/dev/null 2>&1 && HAVE_COPILOT=1
-[ "$HAVE_CLAUDE" = 1 ] || [ "$HAVE_COPILOT" = 1 ] \
-  || die "neither 'claude' nor 'copilot' found on PATH - install one first"
+DETECTED=""
+for t in $TOOLS; do
+  if command -v "$t" >/dev/null 2>&1; then eval "HAVE_$t=1"; DETECTED="$DETECTED $t"; fi
+done
+DETECTED="${DETECTED# }"
+[ -n "$DETECTED" ] || die "no supported CLI found on PATH (claude, copilot, codex, gemini, opencode)"
+set -- $DETECTED; NDET=$#
 
 # --- choose targets ----------------------------------------------------------
-if [ "$ASKED" = 0 ]; then
-  say "Detected CLIs:"
-  [ "$HAVE_CLAUDE" = 1 ]  && note "claude  (Claude Code)"
-  [ "$HAVE_COPILOT" = 1 ] && note "copilot (GitHub Copilot CLI)"
-  if [ "$HAVE_CLAUDE" = 1 ] && [ "$HAVE_COPILOT" = 1 ]; then
-    printf 'Install the voice for [1] Claude Code, [2] Copilot CLI, or [3] both? [3] '
-    read -r pick < /dev/tty || pick=3
-    case "${pick:-3}" in
-      1) WANT_CLAUDE=1 ;;
-      2) WANT_COPILOT=1 ;;
-      3|"") WANT_CLAUDE=1; WANT_COPILOT=1 ;;
-      *) die "unrecognized choice: $pick" ;;
-    esac
+if [ "$ALL" = 1 ]; then
+  for t in $DETECTED; do eval "WANT_$t=1"; done
+elif [ "$ASKED" = 0 ]; then
+  if [ "$NDET" -eq 1 ]; then
+    eval "WANT_$DETECTED=1"
   else
-    WANT_CLAUDE=$HAVE_CLAUDE; WANT_COPILOT=$HAVE_COPILOT
+    say "Detected CLIs:"
+    i=1
+    for t in $DETECTED; do
+      note "[$i] $t ($(tool_desc "$t"))"
+      i=$((i+1))
+    done
+    printf 'Install the voice for which? (numbers separated by spaces, or "all") [all] '
+    read -r pick < /dev/tty || pick=all
+    if [ -z "$pick" ] || [ "$pick" = "all" ]; then
+      for t in $DETECTED; do eval "WANT_$t=1"; done
+    else
+      for n in $pick; do
+        case "$n" in
+          *[!0-9]*) die "unrecognized choice: $n" ;;
+        esac
+        [ "$n" -ge 1 ] && [ "$n" -le "$NDET" ] || die "choice out of range: $n"
+        eval "WANT_$(eval "echo \${$n}")=1"
+      done
+    fi
   fi
 fi
-[ "$WANT_CLAUDE" = 1 ] && [ "$HAVE_CLAUDE" = 0 ] && die "--claude requested but 'claude' not found on PATH"
-[ "$WANT_COPILOT" = 1 ] && [ "$HAVE_COPILOT" = 0 ] && die "--copilot requested but 'copilot' not found on PATH"
+for t in $TOOLS; do
+  [ "$(want "$t")" = 1 ] && [ "$(have "$t")" = 0 ] && die "--$t requested but '$t' not found on PATH"
+done
 
 # --- install the engine --------------------------------------------------------
 say "Setting up $KITTEN_HOME (self-contained venv, ~300 MB)"
@@ -107,15 +141,15 @@ say "Downloading the voice model (~80 MB, one-time, cached by Hugging Face)"
 "$PY" -c "from kittentts import KittenTTS; import os; KittenTTS(os.environ.get('KITTEN_MODEL','KittenML/kitten-tts-mini-0.8'))" \
   || note "model download failed (offline?) - it will retry on first use"
 
-# --- wire up Claude Code ------------------------------------------------------
-if [ "$WANT_CLAUDE" = 1 ]; then
-  say "Configuring Claude Code (~/.claude/settings.json)"
-  mkdir -p "$HOME/.claude"
-  HOOK_CMD="$HOOK_CMD" "$PY" - <<'PYEOF'
+# Merge our hook entries into a Claude-style settings.json without touching
+# anything else. Used for Claude Code and Gemini CLI (same schema).
+merge_json_hooks() {  # $1=settings path  $2=space-separated events  $3=1 to set env
+  SETTINGS_PATH="$1" HOOK_EVENTS="$2" SET_ENV="${3:-0}" HOOK_CMD="$HOOK_CMD" "$PY" - <<'PYEOF'
 import json, os, shutil
 
-path = os.path.expanduser("~/.claude/settings.json")
+path = os.path.expanduser(os.environ["SETTINGS_PATH"])
 cmd = os.environ["HOOK_CMD"]
+events = os.environ["HOOK_EVENTS"].split()
 settings = {}
 if os.path.exists(path):
     shutil.copy(path, path + ".kitten-backup")
@@ -123,7 +157,7 @@ if os.path.exists(path):
         settings = json.load(f)
 
 hooks = settings.setdefault("hooks", {})
-for event in ("Notification", "Stop"):
+for event in events:
     matchers = hooks.setdefault(event, [])
     # drop any previous kitten entries, then add the current one
     for m in matchers:
@@ -131,17 +165,25 @@ for event in ("Notification", "Stop"):
                       if "kitten_voice.py" not in h.get("command", "")]
     matchers[:] = [m for m in matchers if m.get("hooks")]
     matchers.append({"hooks": [{"type": "command", "command": cmd}]})
-settings.setdefault("env", {}).setdefault("KITTEN_STOP_MODE", "summary")
+if os.environ.get("SET_ENV") == "1":
+    settings.setdefault("env", {}).setdefault("KITTEN_STOP_MODE", "summary")
 
+os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
-print("    updated", path, "(backup: settings.json.kitten-backup)")
+print("    updated", path, "(backup: " + os.path.basename(path) + ".kitten-backup)")
 PYEOF
+}
+
+# --- wire up Claude Code ------------------------------------------------------
+if [ "$WANT_claude" = 1 ]; then
+  say "Configuring Claude Code (~/.claude/settings.json)"
+  merge_json_hooks "$HOME/.claude/settings.json" "Notification Stop" 1
 fi
 
 # --- wire up Copilot CLI ------------------------------------------------------
-if [ "$WANT_COPILOT" = 1 ]; then
+if [ "$WANT_copilot" = 1 ]; then
   say "Configuring Copilot CLI (~/.copilot/hooks/kitten-voice.json)"
   mkdir -p "$HOME/.copilot/hooks"
   cat > "$HOME/.copilot/hooks/kitten-voice.json" <<EOF
@@ -163,6 +205,99 @@ EOF
   esac
 fi
 
+# --- wire up Codex CLI ---------------------------------------------------------
+if [ "$WANT_codex" = 1 ]; then
+  say "Configuring Codex CLI (~/.codex/config.toml)"
+  mkdir -p "$HOME/.codex"
+  CFG="$HOME/.codex/config.toml"
+  touch "$CFG"
+  cp "$CFG" "$CFG.kitten-backup"
+  NOTIFY_LINE="notify = [\"$VENV/bin/python\", \"$KITTEN_HOME/kitten_voice.py\", \"--event\", \"codex-notify\"]"
+  if grep -q '^notify *=' "$CFG"; then
+    if grep '^notify *=' "$CFG" | grep -q 'kitten_voice.py'; then
+      NOTIFY_LINE="$NOTIFY_LINE" "$PY" - "$CFG" <<'PYEOF'
+import os, re, sys
+path = sys.argv[1]
+with open(path) as f:
+    s = f.read()
+s = re.sub(r'^notify *=.*kitten_voice\.py.*$', os.environ["NOTIFY_LINE"].replace("\\", "\\\\"), s, flags=re.M)
+with open(path, "w") as f:
+    f.write(s)
+print("    updated", path, "(backup: config.toml.kitten-backup)")
+PYEOF
+    else
+      note "config.toml already has a 'notify' program (Codex allows one) - left untouched."
+      note "To use the voice, point it at: $NOTIFY_LINE"
+    fi
+  else
+    # top-level TOML keys must appear before any [section]; prepend
+    printf '%s\n%s\n' "$NOTIFY_LINE" "$(cat "$CFG")" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+    note "updated $CFG (backup: config.toml.kitten-backup)"
+  fi
+fi
+
+# --- wire up Gemini CLI --------------------------------------------------------
+if [ "$WANT_gemini" = 1 ]; then
+  say "Configuring Gemini CLI (~/.gemini/settings.json)"
+  merge_json_hooks "$HOME/.gemini/settings.json" "Notification AfterAgent" 0
+fi
+
+# --- wire up OpenCode ----------------------------------------------------------
+if [ "$WANT_opencode" = 1 ]; then
+  say "Configuring OpenCode (~/.config/opencode/plugin/kitten-voice.js)"
+  mkdir -p "$HOME/.config/opencode/plugin"
+  cat > "$HOME/.config/opencode/plugin/kitten-voice.js" <<EOF
+// KittenCodeTTS voice plugin - speaks the final message when a session goes
+// idle. Generated by install.sh; safe to delete to uninstall.
+import { spawn } from "node:child_process"
+
+const PY = "$VENV/bin/python"
+const SCRIPT = "$KITTEN_HOME/kitten_voice.py"
+
+function speak(job) {
+  try {
+    const p = spawn(PY, [SCRIPT, "--worker"],
+      { stdio: ["pipe", "ignore", "ignore"], detached: true })
+    p.on("error", () => {})
+    p.stdin.write(JSON.stringify(job))
+    p.stdin.end()
+    p.unref()
+  } catch {}
+}
+
+export const KittenVoice = async ({ client }) => {
+  const lastText = new Map() // sessionID -> latest streamed assistant text
+  return {
+    event: async ({ event }) => {
+      try {
+        if (event.type === "message.part.updated") {
+          const part = event.properties?.part
+          if (part?.type === "text" && part.sessionID) {
+            lastText.set(part.sessionID, part.text ?? "")
+          }
+        } else if (event.type === "session.idle") {
+          const id = event.properties?.sessionID ?? event.properties?.session?.id
+          let text = ""
+          try {
+            const res = await client.session.messages({ path: { id } })
+            const msgs = (res?.data ?? res ?? []).filter(
+              (m) => (m.info?.role ?? m.role) === "assistant")
+            const last = msgs[msgs.length - 1]
+            const parts = last?.parts ?? []
+            text = parts.filter((p) => p.type === "text")
+              .map((p) => p.text ?? "").join("\n").trim()
+          } catch {}
+          if (!text && id) text = (lastText.get(id) ?? "").trim()
+          speak({ mode: "message", text })
+          if (id) lastText.delete(id)
+        }
+      } catch {}
+    },
+  }
+}
+EOF
+fi
+
 # --- confirm ------------------------------------------------------------------
 if [ "$NO_TEST" = 0 ]; then
   say "Testing the voice (you should hear it)"
@@ -172,7 +307,10 @@ if [ "$NO_TEST" = 0 ]; then
 fi
 
 say "Done. Final steps:"
-[ "$WANT_CLAUDE" = 1 ]  && note "Claude Code: restart it (or open /hooks once) to load the new hooks."
-[ "$WANT_COPILOT" = 1 ] && note "Copilot CLI: restart any running session; hooks load from ~/.copilot/hooks."
+[ "$WANT_claude" = 1 ]   && note "Claude Code: restart it (or open /hooks once) to load the new hooks."
+[ "$WANT_copilot" = 1 ]  && note "Copilot CLI: restart any running session; hooks load from ~/.copilot/hooks."
+[ "$WANT_codex" = 1 ]    && note "Codex CLI: no restart needed; notify fires on each completed turn."
+[ "$WANT_gemini" = 1 ]   && note "Gemini CLI: restart any running session to load the new hooks."
+[ "$WANT_opencode" = 1 ] && note "OpenCode: restart it to load the plugin."
 note "Long replies are summarized via 'claude -p' when available; otherwise the opening sentences are read."
 note "Tune with env vars (KITTEN_VOICE, KITTEN_STOP_MODE, ...) - see the README."

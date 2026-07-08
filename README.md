@@ -1,7 +1,8 @@
 # KittenCodeTTS 🐱🔊
 
-A spoken voice for **Claude Code** and **GitHub Copilot CLI**. Your terminal
-agent talks to you:
+A spoken voice for your terminal AI coding agents — **Claude Code**,
+**GitHub Copilot CLI**, **OpenAI Codex CLI**, **Gemini CLI**, and
+**OpenCode**. Your agent talks to you:
 
 - **"Claude needs your permission to run…"** — hear notifications the moment
   the agent wants you, without watching the terminal.
@@ -13,7 +14,21 @@ agent talks to you:
 Speech is generated **locally** by [KittenTTS](https://github.com/KittenML/KittenTTS),
 a ~15M-parameter open-source TTS model — no audio ever leaves your machine.
 
-Works on **macOS and Linux** with either or both CLIs.
+Works on **macOS and Linux**, with any combination of supported tools:
+
+| Tool | Wired via | Status |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` (Notification + Stop hooks) | ✅ verified end-to-end |
+| GitHub Copilot CLI 1.x | `~/.copilot/hooks/kitten-voice.json` (notification + agentStop) | ✅ verified end-to-end |
+| OpenAI Codex CLI | `~/.codex/config.toml` (`notify`, agent-turn-complete) | 🧪 built from official docs, not yet live-verified |
+| Gemini CLI | `~/.gemini/settings.json` (Notification + AfterAgent hooks) | 🧪 built from official docs, not yet live-verified |
+| OpenCode | `~/.config/opencode/plugin/kitten-voice.js` (session.idle) | 🧪 built from official docs, not yet live-verified |
+
+If a 🧪 tool misbehaves for you, please open an issue with the relevant
+config/payload — the adapters are small and easy to fix. (Codex and Gemini
+deliver the final message inline in their payloads, so those adapters skip
+transcript parsing entirely; Codex fires only on completed turns, so it has
+no notification speech.)
 
 ## Install
 
@@ -24,17 +39,19 @@ curl -fsSL https://raw.githubusercontent.com/lozenge0/KittenCodeTTS/main/install
 or from a checkout: `bash install.sh`
 
 The installer detects which CLIs you have, asks which to wire up
-(`--claude`, `--copilot`, `--both` skip the menu; `--no-test` skips the spoken
-confirmation), then:
+(`--claude`, `--copilot`, `--codex`, `--gemini`, `--opencode`, or `--all`
+skip the menu; `--no-test` skips the spoken confirmation), then:
 
 1. builds a self-contained engine in `~/.kitten-voice/` (venv ~300 MB; the
    voice model, ~80 MB, is fetched from Hugging Face and cached),
-2. wires the hooks — Claude Code via `~/.claude/settings.json` (a backup is
-   written first; your other hooks and settings are untouched, and re-running
-   never duplicates entries), Copilot via `~/.copilot/hooks/kitten-voice.json`.
+2. wires the hooks per the table above. Config files that hold your other
+   settings (Claude, Gemini, Codex) get a `.kitten-backup` copy first, are
+   merged rather than overwritten, and re-running never duplicates entries.
+   If Codex already has a `notify` program configured (it allows only one),
+   yours is left untouched and the line to add manually is printed.
 
 The only manual step: **restart your CLI** (or open `/hooks` once in Claude
-Code) so the new hook config is loaded.
+Code) so the new hook config is loaded. Codex needs no restart.
 
 Requirements: python3 ≥ 3.9; on Linux, one of `paplay`, `aplay`, or `ffplay`
 for playback (macOS uses the built-in `afplay`). Copilot CLI must be 1.x+ —
@@ -42,8 +59,11 @@ older versions ignore hooks silently (`copilot update`).
 
 ## Uninstall
 
-Delete `~/.kitten-voice`, remove the two `kitten_voice.py` hook entries from
-`~/.claude/settings.json`, and delete `~/.copilot/hooks/kitten-voice.json`.
+Delete `~/.kitten-voice`, then remove whichever of these you installed: the
+`kitten_voice.py` hook entries in `~/.claude/settings.json` and
+`~/.gemini/settings.json`, the `notify` line in `~/.codex/config.toml`,
+`~/.copilot/hooks/kitten-voice.json`, and
+`~/.config/opencode/plugin/kitten-voice.js`.
 
 ## How it works
 

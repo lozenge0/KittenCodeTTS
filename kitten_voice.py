@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""KittenCodeTTS — a spoken voice for Claude Code and GitHub Copilot CLI.
+"""KittenCodeTTS — a spoken voice for AI coding agents in your terminal.
 
 Speaks notifications (when the agent needs your attention) and the agent's
 final message when a turn ends, using KittenTTS — a tiny local text-to-speech
 model. Install with install.sh, which wires this script into:
 
-  Claude Code   ~/.claude/settings.json   events: Notification, Stop
-  Copilot CLI   ~/.copilot/hooks/*.json   events: notification, agentStop
+  Claude Code   ~/.claude/settings.json          events: Notification, Stop
+  Copilot CLI   ~/.copilot/hooks/*.json          events: notification, agentStop
+  Codex CLI     ~/.codex/config.toml             notify: agent-turn-complete
+  Gemini CLI    ~/.gemini/settings.json          events: Notification, AfterAgent
+  OpenCode      ~/.config/opencode/plugin/*.js   event: session.idle
 
-Both CLIs pipe a JSON payload on stdin. Claude Code names the event inside
-the payload (hook_event_name); Copilot doesn't, so its hooks are registered
-with an explicit `--event <name>` argument.
+Claude Code, Copilot, and Gemini pipe a JSON payload on stdin (Copilot's
+carries no event name, so its hooks are registered with an explicit
+`--event <name>` argument). Codex passes its payload as a trailing argv
+argument and includes the final message inline; Gemini includes it as
+prompt_response; OpenCode's plugin extracts it and calls --worker directly.
 
 Two modes:
   hook mode (default): read the payload, then spawn a detached worker and
@@ -84,6 +89,7 @@ def clean_for_speech(text):
     text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)  # headers
     text = re.sub(r"[*_>#]+", " ", text)                   # emphasis/quote marks
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)           # "bar ." -> "bar."
     return text.strip()
 
 
@@ -277,8 +283,13 @@ def stop_text(transcript_path):
             log("stop: unrecognized transcript format, chiming instead")
             return CHIME
         return None
+    return render_stop_text(msg)
+
+
+def render_stop_text(msg):
+    """Turn a raw final message ('' = turn ended with no text) into speech."""
     if not msg:
-        return CHIME  # turn ended on a tool call; nothing to read aloud
+        return CHIME
     text = clean_for_speech(msg)
     if STOP_MODE == "full" or len(text) <= MAX_CHARS:
         return text
@@ -347,6 +358,9 @@ def run_worker():
     try:
         if payload.get("mode") == "stop":
             text = stop_text(payload.get("transcript_path"))
+        elif payload.get("mode") == "message":
+            # final message delivered inline (Codex, Gemini, OpenCode)
+            text = render_stop_text((payload.get("text") or "").strip())
         else:
             text = payload.get("text", "")
         if text:
@@ -374,16 +388,42 @@ def spawn_worker(job):
         log(f"spawn error: {e}")
 
 
-def run_hook(forced_event=None):
+def spawn_stop_message(text):
+    """Speak a final message that arrived inline (no transcript involved)."""
+    if STOP_MODE == "off":
+        return
+    if STOP_MODE == "chime":
+        spawn_worker({"mode": "speak", "text": CHIME, "voice": VOICE})
+        return
+    spawn_worker({"mode": "message", "text": text or "", "voice": VOICE})
+
+
+def run_hook(forced_event=None, argv_payload=None):
     if os.environ.get("KITTEN_DISABLE") == "1":
         return
+
+    if forced_event == "codex-notify":
+        # Codex passes the payload as a trailing argv argument, not stdin,
+        # and its notify hook only fires for completed turns.
+        try:
+            data = json.loads(argv_payload or "{}")
+        except Exception:
+            return
+        if data.get("type") != "agent-turn-complete":
+            return
+        spawn_stop_message(data.get("last-assistant-message"))
+        return
+
     try:
         data = json.load(sys.stdin)
     except Exception:
         data = {}
     event = forced_event or data.get("hook_event_name", "")
 
-    if event in NOTIFY_EVENTS:
+    if event == "AfterAgent":
+        # Gemini CLI includes the final response text in the payload.
+        spawn_stop_message(data.get("prompt_response"))
+    elif event in NOTIFY_EVENTS:
         if NOTIFY != "on":
             return
         text = (data.get("message") or data.get("title") or data.get("body")
@@ -415,7 +455,9 @@ def main(argv):
         i = argv.index("--event")
         if i + 1 < len(argv):
             forced_event = argv[i + 1]
-    run_hook(forced_event)
+    # Codex appends its JSON payload as the final argv argument.
+    argv_payload = argv[-1] if argv and argv[-1].startswith("{") else None
+    run_hook(forced_event, argv_payload)
 
 
 if __name__ == "__main__":
