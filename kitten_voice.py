@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""KittenCodeTTS — a spoken voice for Claude Code and GitHub Copilot CLI.
+
+Speaks notifications (when the agent needs your attention) and the agent's
+final message when a turn ends, using KittenTTS — a tiny local text-to-speech
+model. Install with install.sh, which wires this script into:
+
+  Claude Code   ~/.claude/settings.json   events: Notification, Stop
+  Copilot CLI   ~/.copilot/hooks/*.json   events: notification, agentStop
+
+Both CLIs pipe a JSON payload on stdin. Claude Code names the event inside
+the payload (hook_event_name); Copilot doesn't, so its hooks are registered
+with an explicit `--event <name>` argument.
+
+Two modes:
+  hook mode (default): read the payload, then spawn a detached worker and
+      return immediately so the agent is never blocked.
+  --worker: read a job JSON from stdin. For stop jobs the worker (not the
+      hook) extracts the final message from the transcript — it can afford to
+      wait out the write race where the stop event fires before the
+      transcript is fully flushed.
+
+What gets spoken on stop (KITTEN_STOP_MODE=summary, the default):
+  - message fits in KITTEN_MAX_CHARS -> read the whole thing
+  - longer -> ask `claude -p` (falling back to `copilot -p`) for a 1-2
+    sentence summary of the FULL message; if no CLI is available, fall back
+    to speaking the opening sentences
+  - turn ended on a tool call with no final text -> speak the chime instead
+    of hunting backwards for stale mid-turn text
+
+Design rule: this must NEVER break the session. Every failure path exits 0.
+Errors (and each spoken line) are appended to kitten_voice.log next to this
+file.
+
+Tuning (all optional env vars):
+  KITTEN_VOICE          voice name (default: Kiki). One of Bella, Jasper,
+                        Luna, Bruno, Rosie, Hugo, Kiki, Leo.
+  KITTEN_MODEL          HF model id (default: KittenML/kitten-tts-mini-0.8).
+  KITTEN_STOP_MODE      summary | full | chime | off  (default: summary)
+  KITTEN_CHIME          chime phrase (default: "Done.")
+  KITTEN_NOTIFY         on | off  (default: on)
+  KITTEN_MAX_CHARS      read-it-all threshold / spoken cap (default: 400)
+  KITTEN_SUMMARY_MODEL  model passed to `claude -p` (default: haiku)
+  KITTEN_DISABLE        set to 1 to silence the hook entirely; also set on
+                        nested `claude -p`/`copilot -p` calls so summarizing
+                        a message can't recursively trigger this hook
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG = os.path.join(HERE, "kitten_voice.log")
+
+VOICE = os.environ.get("KITTEN_VOICE", "Kiki")
+MODEL = os.environ.get("KITTEN_MODEL", "KittenML/kitten-tts-mini-0.8")
+STOP_MODE = os.environ.get("KITTEN_STOP_MODE", "summary").lower()
+CHIME = os.environ.get("KITTEN_CHIME", "Done.")
+NOTIFY = os.environ.get("KITTEN_NOTIFY", "on").lower()
+MAX_CHARS = int(os.environ.get("KITTEN_MAX_CHARS", "400"))
+SUMMARY_MODEL = os.environ.get("KITTEN_SUMMARY_MODEL", "haiku")
+
+STOP_EVENTS = {"Stop", "agentStop"}
+NOTIFY_EVENTS = {"Notification", "notification"}
+
+
+def log(msg):
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def clean_for_speech(text):
+    """Strip markdown/code so the synthesizer speaks prose, not syntax."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)   # fenced code blocks
+    text = re.sub(r"`([^`]*)`", r"\1", text)               # inline code
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text) # links/images -> label
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)  # headers
+    text = re.sub(r"[*_>#]+", " ", text)                   # emphasis/quote marks
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def truncate_sentences(text):
+    """Cut cleaned text to MAX_CHARS, ending on a sentence boundary."""
+    if len(text) <= MAX_CHARS:
+        return text
+    out = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if out and len(out) + len(sentence) + 1 > MAX_CHARS:
+            break
+        out = (out + " " + sentence).strip()
+    if not out:  # first "sentence" already too long -> hard cut on a word
+        out = text[:MAX_CHARS].rsplit(" ", 1)[0]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Transcript reading (worker side)
+# ---------------------------------------------------------------------------
+
+def wait_for_stable(path, settle=1.0, timeout=8.0):
+    """Wait until the transcript has stopped growing for `settle` seconds.
+
+    Stop events can fire while the CLI is still flushing the final message
+    to the transcript. The worker is detached, so a ~1s pause before
+    synthesis is imperceptible — trade latency for not reading a stale
+    message.
+    """
+    deadline = time.time() + timeout
+    last_size = -1
+    last_change = time.time()
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        now = time.time()
+        if size != last_size:
+            last_size, last_change = size, now
+        elif now - last_change >= settle:
+            return
+        time.sleep(0.1)
+
+
+def _read_jsonl(path):
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue  # half-written trailing line etc.
+    return entries
+
+
+def _final_claude(entries):
+    """Claude Code transcript: one line per content block of a message.
+
+    Collect text across every line sharing the final message's id (grabbing
+    just the newest text-bearing line can return stale mid-turn narration),
+    and skip subagent (sidechain) lines so a background agent can't hijack
+    the voice. Returns None if there are no main-thread assistant entries.
+    """
+    entries = [e for e in entries
+               if e.get("type") == "assistant" and not e.get("isSidechain")]
+    if not entries:
+        return None
+    final_id = entries[-1].get("message", {}).get("id")
+    if final_id:
+        group = [e for e in entries
+                 if e.get("message", {}).get("id") == final_id]
+    else:
+        group = [entries[-1]]
+    parts = []
+    for e in group:
+        content = e.get("message", {}).get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts += [b.get("text", "") for b in content
+                      if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _final_copilot(entries):
+    """Copilot CLI events.jsonl: assistant text lives in assistant.message.
+
+    Each turn's reply is {"type": "assistant.message", "data": {"content":
+    "..."}}. Take the last one; empty content means the turn ended without
+    final text. Returns None if there are no assistant.message entries.
+    """
+    msgs = [e for e in entries if e.get("type") == "assistant.message"]
+    if not msgs:
+        return None
+    content = msgs[-1].get("data", {}).get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def final_message_text(path):
+    """Text of the agent's final message, whichever CLI wrote the transcript.
+
+    Returns None if the transcript is unreadable or matches no known format,
+    and "" if the final message contained no text (turn ended on a tool
+    call).
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        entries = _read_jsonl(path)
+    except Exception as e:
+        log(f"transcript read error: {e}")
+        return None
+    for parse in (_final_claude, _final_copilot):
+        text = parse(entries)
+        if text is not None:
+            return text
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Summarization (worker side)
+# ---------------------------------------------------------------------------
+
+def _which(name, extra=()):
+    import shutil
+    exe = shutil.which(name)
+    if exe:
+        return exe
+    for candidate in extra:
+        candidate = os.path.expanduser(candidate)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def summarize_with_llm(text):
+    """Real summary of the full message via a CLI. None on any failure.
+
+    Prefers `claude -p` (cheap haiku call); falls back to `copilot -p`.
+    KITTEN_DISABLE=1 on the child stops the nested run's own stop hook from
+    re-entering this script (infinite speech loop otherwise).
+    """
+    prompt = (
+        "Condense the following assistant reply into at most two short plain "
+        "sentences to be read aloud by a text-to-speech voice. Lead with the "
+        "outcome. No markdown, no preamble, no quotes - reply with only the "
+        "summary."
+    )
+    body = text[:8000]
+    env = dict(os.environ, KITTEN_DISABLE="1")
+
+    claude = _which("claude", ("~/.claude/local/claude", "~/.local/bin/claude",
+                               "/opt/homebrew/bin/claude", "/usr/local/bin/claude"))
+    copilot = _which("copilot", ("/opt/homebrew/bin/copilot",
+                                 "/usr/local/bin/copilot"))
+    if claude:
+        cmd, stdin = [claude, "-p", prompt, "--model", SUMMARY_MODEL], body
+    elif copilot:
+        cmd, stdin = [copilot, "-p", prompt + "\n\n" + body,
+                      "--log-level", "none"], ""
+    else:
+        log("summarizer: no claude/copilot CLI found, falling back to truncation")
+        return None
+    try:
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                           timeout=60, env=env)
+    except Exception as e:
+        log(f"summarizer error: {e}")
+        return None
+    if r.returncode != 0:
+        log(f"summarizer exit {r.returncode}: {(r.stderr or '').strip()[:200]}")
+        return None
+    return clean_for_speech(r.stdout) or None
+
+
+def stop_text(transcript_path):
+    """Decide what a stop event should say. None means stay silent."""
+    if not transcript_path:
+        return None
+    wait_for_stable(transcript_path)
+    msg = final_message_text(transcript_path)
+    if msg is None:  # one late-flush retry before giving up
+        time.sleep(1.0)
+        msg = final_message_text(transcript_path)
+    if msg is None:
+        if os.path.exists(transcript_path):
+            log("stop: unrecognized transcript format, chiming instead")
+            return CHIME
+        return None
+    if not msg:
+        return CHIME  # turn ended on a tool call; nothing to read aloud
+    text = clean_for_speech(msg)
+    if STOP_MODE == "full" or len(text) <= MAX_CHARS:
+        return text
+    summary = summarize_with_llm(msg)
+    return truncate_sentences(summary if summary else text)
+
+
+# ---------------------------------------------------------------------------
+# Synthesis + playback (worker side)
+# ---------------------------------------------------------------------------
+
+def _player_cmd(wav):
+    """First available audio player: macOS afplay, then Linux options."""
+    import shutil
+    if shutil.which("afplay"):
+        return ["afplay", wav]
+    if shutil.which("paplay"):
+        return ["paplay", wav]
+    if shutil.which("aplay"):
+        return ["aplay", "-q", wav]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", wav]
+    return None
+
+
+def speak(text, voice):
+    """Synthesize `text` and play it, serialized so turns don't overlap."""
+    text = (text or "").strip()
+    if not text:
+        return
+    import soundfile as sf
+    from kittentts import KittenTTS
+
+    model = KittenTTS(MODEL)
+    audio = model.generate(text, voice=voice, clean_text=True)
+
+    fd, wav = tempfile.mkstemp(prefix="kitten_", suffix=".wav")
+    os.close(fd)
+    try:
+        sf.write(wav, audio, 24000)
+        cmd = _player_cmd(wav)
+        if not cmd:
+            log("no audio player found (need afplay, paplay, aplay, or ffplay)")
+            return
+        # Serialize playback across concurrent workers with a file lock, so
+        # two quick turns don't talk over each other.
+        import fcntl
+        lock = os.path.join(tempfile.gettempdir(), "kitten_voice.lock")
+        with open(lock, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            log(f"speak: {text[:100]}")
+            subprocess.run(cmd)
+    finally:
+        try:
+            os.remove(wav)
+        except Exception:
+            pass
+
+
+def run_worker():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        log(f"worker payload error: {e}")
+        return
+    try:
+        if payload.get("mode") == "stop":
+            text = stop_text(payload.get("transcript_path"))
+        else:
+            text = payload.get("text", "")
+        if text:
+            speak(text, payload.get("voice", VOICE))
+    except Exception as e:
+        log(f"worker error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Hook entry (must return instantly)
+# ---------------------------------------------------------------------------
+
+def spawn_worker(job):
+    try:
+        p = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        p.stdin.write(json.dumps(job).encode())
+        p.stdin.close()
+    except Exception as e:
+        log(f"spawn error: {e}")
+
+
+def run_hook(forced_event=None):
+    if os.environ.get("KITTEN_DISABLE") == "1":
+        return
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    event = forced_event or data.get("hook_event_name", "")
+
+    if event in NOTIFY_EVENTS:
+        if NOTIFY != "on":
+            return
+        text = (data.get("message") or data.get("title") or data.get("body")
+                or data.get("text") or "The agent needs your attention.")
+        spawn_worker({"mode": "speak", "text": text, "voice": VOICE})
+    elif event in STOP_EVENTS:
+        if STOP_MODE == "off":
+            return
+        # Copilot reports why the turn ended; don't narrate aborted turns.
+        reason = data.get("stopReason")
+        if reason and reason not in ("end_turn", "stop", "completed"):
+            return
+        if STOP_MODE == "chime":
+            spawn_worker({"mode": "speak", "text": CHIME, "voice": VOICE})
+            return
+        # All transcript reading happens in the worker: it can wait out the
+        # race where the stop event fires before the final message is
+        # flushed to disk.
+        path = data.get("transcript_path") or data.get("transcriptPath")
+        spawn_worker({"mode": "stop", "transcript_path": path, "voice": VOICE})
+
+
+def main(argv):
+    if "--worker" in argv:
+        run_worker()
+        return
+    forced_event = None
+    if "--event" in argv:
+        i = argv.index("--event")
+        if i + 1 < len(argv):
+            forced_event = argv[i + 1]
+    run_hook(forced_event)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
