@@ -152,5 +152,21 @@ check("codex-payload-parses",
 check("codex-argv-detected",
       codex_payload.startswith("{"), True)
 
+# ---- native-tool summarizer invocations ---------------------------------------
+
+cmd, stdin = kv._summarizer_invocation("claude", "/x/claude", "P", "B")
+check("summarize-claude", (cmd, stdin),
+      (["/x/claude", "-p", "P", "--model", kv.SUMMARY_MODEL], "B"))
+cmd, stdin = kv._summarizer_invocation("copilot", "/x/copilot", "P", "B")
+check("summarize-copilot", (cmd, stdin),
+      (["/x/copilot", "-p", "P\n\nB", "--log-level", "none"], ""))
+cmd, stdin = kv._summarizer_invocation("codex", "/x/codex", "P", "B")
+check("summarize-codex", (cmd, stdin),
+      (["/x/codex", "exec", "--skip-git-repo-check", "P"], "B"))
+cmd, stdin = kv._summarizer_invocation("gemini", "/x/gemini", "P", "B")
+check("summarize-gemini", (cmd, stdin), (["/x/gemini", "-p", "P"], "B"))
+cmd, stdin = kv._summarizer_invocation("opencode", "/x/opencode", "P", "B")
+check("summarize-opencode", (cmd, stdin), (["/x/opencode", "run", "P\n\nB"], ""))
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

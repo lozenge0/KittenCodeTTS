@@ -89,11 +89,14 @@ a known-good commit (override with `KITTEN_ENGINE_REF=<sha>`).
 ## Privacy & cost — read this once
 
 - Speech synthesis is fully local. Nothing is sent anywhere to make audio.
-- **Long replies are summarized by your own LLM CLI**: the message text is
-  piped to `claude -p` (a small Haiku call), falling back to `copilot -p`
-  (which spends a premium request). If neither is available, the opening
-  sentences are read instead — no network involved. Set
-  `KITTEN_MAX_CHARS` higher to summarize less often, or
+- **Long replies are summarized by the same tool that produced them**: a
+  Claude Code reply is condensed by `claude -p` (a small Haiku call), a
+  Copilot reply by `copilot -p` (a premium request), Gemini by `gemini -p`,
+  Codex by `codex exec` (read-only sandbox), OpenCode by `opencode run` —
+  so nothing leaves the AI tool you were already talking to, and billing
+  stays put. If the native tool fails, one other installed CLI is tried;
+  if none work, the opening sentences are read instead — no network
+  involved. Set `KITTEN_MAX_CHARS` higher to summarize less often, or
   `KITTEN_STOP_MODE=chime` to never send anything.
 - The log file records a snippet of each spoken line for debugging. It stays
   on your machine; delete it whenever.

@@ -269,6 +269,8 @@ export const KittenVoice = async ({ client }) => {
   const lastText = new Map() // sessionID -> latest streamed assistant text
   return {
     event: async ({ event }) => {
+      // A nested summarizer run must not re-trigger the voice.
+      if (process.env.KITTEN_DISABLE === "1") return
       try {
         if (event.type === "message.part.updated") {
           const part = event.properties?.part
@@ -288,7 +290,7 @@ export const KittenVoice = async ({ client }) => {
               .map((p) => p.text ?? "").join("\n").trim()
           } catch {}
           if (!text && id) text = (lastText.get(id) ?? "").trim()
-          speak({ mode: "message", text })
+          speak({ mode: "message", text, source: "opencode" })
           if (id) lastText.delete(id)
         }
       } catch {}
@@ -312,5 +314,5 @@ say "Done. Final steps:"
 [ "$WANT_codex" = 1 ]    && note "Codex CLI: no restart needed; notify fires on each completed turn."
 [ "$WANT_gemini" = 1 ]   && note "Gemini CLI: restart any running session to load the new hooks."
 [ "$WANT_opencode" = 1 ] && note "OpenCode: restart it to load the plugin."
-note "Long replies are summarized via 'claude -p' when available; otherwise the opening sentences are read."
+note "Long replies are summarized by the same CLI that produced them; without one, the opening sentences are read."
 note "Tune with env vars (KITTEN_VOICE, KITTEN_STOP_MODE, ...) - see the README."

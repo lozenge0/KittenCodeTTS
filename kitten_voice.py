@@ -27,9 +27,10 @@ Two modes:
 
 What gets spoken on stop (KITTEN_STOP_MODE=summary, the default):
   - message fits in KITTEN_MAX_CHARS -> read the whole thing
-  - longer -> ask `claude -p` (falling back to `copilot -p`) for a 1-2
-    sentence summary of the FULL message; if no CLI is available, fall back
-    to speaking the opening sentences
+  - longer -> ask the tool the message came from for a 1-2 sentence summary
+    of the FULL message (a Copilot session summarizes with `copilot -p`, a
+    Gemini session with `gemini -p`, ...), trying one other installed CLI if
+    the native one fails, then falling back to the opening sentences
   - turn ended on a tool call with no final text -> speak the chime instead
     of hunting backwards for stale mid-turn text
 
@@ -229,12 +230,47 @@ def _which(name, extra=()):
     return None
 
 
-def summarize_with_llm(text):
+TOOL_EXTRA_PATHS = {
+    "claude": ("~/.claude/local/claude", "~/.local/bin/claude",
+               "/opt/homebrew/bin/claude", "/usr/local/bin/claude"),
+    "copilot": ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot"),
+    "codex": ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"),
+    "gemini": ("/opt/homebrew/bin/gemini", "/usr/local/bin/gemini"),
+    "opencode": ("/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"),
+}
+
+
+def _summarizer_invocation(tool, exe, prompt, body):
+    """Headless one-shot invocation for each supported CLI.
+
+    claude/gemini/codex take the instruction as an argument and the message
+    as piped stdin; copilot/opencode get both combined in the argument.
+    codex exec streams progress to stderr and prints only the final message
+    to stdout, in a read-only sandbox by default.
+    """
+    if tool == "claude":
+        return [exe, "-p", prompt, "--model", SUMMARY_MODEL], body
+    if tool == "copilot":
+        return [exe, "-p", prompt + "\n\n" + body, "--log-level", "none"], ""
+    if tool == "codex":
+        return [exe, "exec", "--skip-git-repo-check", prompt], body
+    if tool == "gemini":
+        return [exe, "-p", prompt], body
+    if tool == "opencode":
+        return [exe, "run", prompt + "\n\n" + body], ""
+    return None, None
+
+
+def summarize_with_llm(text, source=None):
     """Real summary of the full message via a CLI. None on any failure.
 
-    Prefers `claude -p` (cheap haiku call); falls back to `copilot -p`.
-    KITTEN_DISABLE=1 on the child stops the nested run's own stop hook from
-    re-entering this script (infinite speech loop otherwise).
+    Uses the tool the message came from (a Copilot session summarizes with
+    `copilot -p`, a Gemini session with `gemini -p`, ...) so billing and
+    behavior stay within the tool you were already using. If the native
+    tool is missing or fails, one other installed CLI is tried; after that
+    the caller falls back to truncation. KITTEN_DISABLE=1 on the child
+    stops the nested run's own stop hook / plugin from re-entering this
+    script (infinite speech loop otherwise).
     """
     prompt = (
         "Condense the following assistant reply into at most two short plain "
@@ -245,31 +281,37 @@ def summarize_with_llm(text):
     body = text[:8000]
     env = dict(os.environ, KITTEN_DISABLE="1")
 
-    claude = _which("claude", ("~/.claude/local/claude", "~/.local/bin/claude",
-                               "/opt/homebrew/bin/claude", "/usr/local/bin/claude"))
-    copilot = _which("copilot", ("/opt/homebrew/bin/copilot",
-                                 "/usr/local/bin/copilot"))
-    if claude:
-        cmd, stdin = [claude, "-p", prompt, "--model", SUMMARY_MODEL], body
-    elif copilot:
-        cmd, stdin = [copilot, "-p", prompt + "\n\n" + body,
-                      "--log-level", "none"], ""
-    else:
-        log("summarizer: no claude/copilot CLI found, falling back to truncation")
-        return None
-    try:
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
-                           timeout=60, env=env)
-    except Exception as e:
-        log(f"summarizer error: {e}")
-        return None
-    if r.returncode != 0:
-        log(f"summarizer exit {r.returncode}: {(r.stderr or '').strip()[:200]}")
-        return None
-    return clean_for_speech(r.stdout) or None
+    order = [t for t in ("claude", "copilot", "gemini", "codex", "opencode")
+             if t != source]
+    if source:
+        order.insert(0, source)
+    attempts = 0
+    for tool in order:
+        if attempts >= 2:  # native + one fallback keeps latency bounded
+            break
+        exe = _which(tool, TOOL_EXTRA_PATHS.get(tool, ()))
+        if not exe:
+            continue
+        cmd, stdin = _summarizer_invocation(tool, exe, prompt, body)
+        attempts += 1
+        try:
+            r = subprocess.run(cmd, input=stdin, capture_output=True,
+                               text=True, timeout=60, env=env)
+        except Exception as e:
+            log(f"summarizer {tool} error: {e}")
+            continue
+        if r.returncode != 0:
+            log(f"summarizer {tool} exit {r.returncode}: "
+                f"{(r.stderr or '').strip()[:200]}")
+            continue
+        out = clean_for_speech(r.stdout)
+        if out:
+            return out
+    log("summarizer: no CLI produced a summary, falling back to truncation")
+    return None
 
 
-def stop_text(transcript_path):
+def stop_text(transcript_path, source=None):
     """Decide what a stop event should say. None means stay silent."""
     if not transcript_path:
         return None
@@ -283,17 +325,17 @@ def stop_text(transcript_path):
             log("stop: unrecognized transcript format, chiming instead")
             return CHIME
         return None
-    return render_stop_text(msg)
+    return render_stop_text(msg, source)
 
 
-def render_stop_text(msg):
+def render_stop_text(msg, source=None):
     """Turn a raw final message ('' = turn ended with no text) into speech."""
     if not msg:
         return CHIME
     text = clean_for_speech(msg)
     if STOP_MODE == "full" or len(text) <= MAX_CHARS:
         return text
-    summary = summarize_with_llm(msg)
+    summary = summarize_with_llm(msg, source)
     return truncate_sentences(summary if summary else text)
 
 
@@ -357,10 +399,12 @@ def run_worker():
         return
     try:
         if payload.get("mode") == "stop":
-            text = stop_text(payload.get("transcript_path"))
+            text = stop_text(payload.get("transcript_path"),
+                             payload.get("source"))
         elif payload.get("mode") == "message":
             # final message delivered inline (Codex, Gemini, OpenCode)
-            text = render_stop_text((payload.get("text") or "").strip())
+            text = render_stop_text((payload.get("text") or "").strip(),
+                                    payload.get("source"))
         else:
             text = payload.get("text", "")
         if text:
@@ -388,14 +432,15 @@ def spawn_worker(job):
         log(f"spawn error: {e}")
 
 
-def spawn_stop_message(text):
+def spawn_stop_message(text, source):
     """Speak a final message that arrived inline (no transcript involved)."""
     if STOP_MODE == "off":
         return
     if STOP_MODE == "chime":
         spawn_worker({"mode": "speak", "text": CHIME, "voice": VOICE})
         return
-    spawn_worker({"mode": "message", "text": text or "", "voice": VOICE})
+    spawn_worker({"mode": "message", "text": text or "", "voice": VOICE,
+                  "source": source})
 
 
 def run_hook(forced_event=None, argv_payload=None):
@@ -411,7 +456,7 @@ def run_hook(forced_event=None, argv_payload=None):
             return
         if data.get("type") != "agent-turn-complete":
             return
-        spawn_stop_message(data.get("last-assistant-message"))
+        spawn_stop_message(data.get("last-assistant-message"), "codex")
         return
 
     try:
@@ -422,7 +467,7 @@ def run_hook(forced_event=None, argv_payload=None):
 
     if event == "AfterAgent":
         # Gemini CLI includes the final response text in the payload.
-        spawn_stop_message(data.get("prompt_response"))
+        spawn_stop_message(data.get("prompt_response"), "gemini")
     elif event in NOTIFY_EVENTS:
         if NOTIFY != "on":
             return
@@ -443,7 +488,9 @@ def run_hook(forced_event=None, argv_payload=None):
         # race where the stop event fires before the final message is
         # flushed to disk.
         path = data.get("transcript_path") or data.get("transcriptPath")
-        spawn_worker({"mode": "stop", "transcript_path": path, "voice": VOICE})
+        source = "copilot" if event == "agentStop" else "claude"
+        spawn_worker({"mode": "stop", "transcript_path": path, "voice": VOICE,
+                      "source": source})
 
 
 def main(argv):
