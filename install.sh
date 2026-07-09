@@ -127,8 +127,8 @@ done
 # --- choose how long replies get summarized -----------------------------------
 if [ -z "$SUMMARIZER" ]; then
   say "How should long replies be summarized before being spoken?"
-  note "[1] locally - small on-device model, ~230 MB one-time download, fully offline"
-  note "[2] with the coding tool itself (claude -p, copilot -p, ...) - no download, uses your plan's tokens"
+  note "[1] locally - the key sentences are extracted on-device: instant, offline, nothing is ever sent anywhere"
+  note "[2] with the coding tool itself (claude -p, copilot -p, ...) - richer summaries, uses your plan's tokens"
   printf 'Choice [1] '
   read -r spick < /dev/tty || spick=1
   case "${spick:-1}" in
@@ -144,7 +144,7 @@ mkdir -p "$KITTEN_HOME"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
 say "Installing the KittenTTS engine (pinned to KittenML/KittenTTS@${ENGINE_REF:0:7})"
-"$VENV/bin/pip" install --quiet "$ENGINE_URL" tokenizers
+"$VENV/bin/pip" install --quiet "$ENGINE_URL"
 
 # The hook script: next to this installer in a checkout, downloaded otherwise.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
@@ -160,17 +160,6 @@ say "Downloading the voice model (~80 MB, one-time, cached by Hugging Face)"
   || note "model download failed (offline?) - it will retry on first use"
 
 printf '{\n  "summarizer": "%s"\n}\n' "$SUMMARIZER" > "$KITTEN_HOME/config.json"
-if [ "$SUMMARIZER" = "local" ]; then
-  say "Downloading the local summarizer model (~230 MB, one-time, cached by Hugging Face)"
-  "$PY" - <<'PYEOF' || note "summarizer download failed (offline?) - it will retry on first use"
-import os
-from huggingface_hub import hf_hub_download
-repo = os.environ.get("KITTEN_LOCAL_MODEL", "Xenova/distilbart-cnn-6-6")
-for f in ("onnx/encoder_model_quantized.onnx",
-          "onnx/decoder_model_quantized.onnx", "tokenizer.json"):
-    hf_hub_download(repo, f)
-PYEOF
-fi
 
 # Merge our hook entries into a Claude-style settings.json without touching
 # anything else. Used for Claude Code and Gemini CLI (same schema).

@@ -168,45 +168,66 @@ check("summarize-gemini", (cmd, stdin), (["/x/gemini", "-p", "P"], "B"))
 cmd, stdin = kv._summarizer_invocation("opencode", "/x/opencode", "P", "B")
 check("summarize-opencode", (cmd, stdin), (["/x/opencode", "run", "P\n\nB"], ""))
 
-# ---- local (ONNX) summarizer -------------------------------------------------
+# ---- local (extractive) summarizer --------------------------------------------
 
-check("dedupe-drops-repeats",
-      kv._dedupe_sentences("The fix works. The fix works. Tests pass now."),
-      "The fix works. Tests pass now.")
-check("dedupe-keeps-distinct",
-      kv._dedupe_sentences("Build failed. The cause is a missing key."),
-      "Build failed. The cause is a missing key.")
+MD_MSG = """All three services are migrated and deployed. Here's the summary:
 
-# env var overrides the install-time summarizer choice
-os.environ["KITTEN_SUMMARIZER"] = "local"
-spec2 = importlib.util.spec_from_file_location(
-    "kv2", os.path.join(ROOT, "kitten_voice.py"))
-kv2 = importlib.util.module_from_spec(spec2)
-spec2.loader.exec_module(kv2)
-check("summarizer-env-override", kv2.SUMMARIZER, "local")
-del os.environ["KITTEN_SUMMARIZER"]
+## What changed
 
-# full local summarization - only when deps + cached model are present
-# (CI runs stdlib-only python, so this skips there)
-try:
-    import onnxruntime, tokenizers, numpy  # noqa: F401
-    kv._hf_file(kv.LOCAL_MODEL, "tokenizer.json")
-    can_local = True
-except Exception:
-    can_local = False
-if can_local:
-    long_msg = ("The deployment pipeline is fixed. The staging config was "
-                "pointing at a rotated secret, so the new pods crashed on "
-                "startup with a missing PAYMENTS_API_KEY. I updated the helm "
-                "values to reference the new secret name, redeployed, and "
-                "watched the canary go green. All health checks pass and "
-                "traffic is being served normally again.")
-    s = kv.summarize_local(long_msg)
-    check("local-summary-nonempty", bool(s and len(s) > 20), True)
-    check("local-summary-shorter", len(s) < len(long_msg), True)
-    print("    local summary:", s)
-else:
-    print("SKIP local-summary (deps or model not present)")
+- Moved the auth middleware into a shared package
+- Added retry logic with exponential backoff
+
+```python
+def retry(fn):
+    return backoff(fn)
+```
+
+| Service | Status |
+|---|---|
+| api | migrated |
+| worker | migrated |
+
+The staging benchmarks show throughput up forty percent. Some filler text
+about the weather that says nothing important at all for anyone. All 214
+tests pass and the linter is clean. More filler prose that just describes
+scenery and adds nothing of value to the report whatsoever, honestly.
+You need to delete the old cron entries once you are confident."""
+
+out = kv.summarize_local(MD_MSG)
+check("extract-nonempty", bool(out and len(out) > 20), True)
+check("extract-within-budget", len(out) <= kv.MAX_CHARS, True)
+check("extract-no-code", "backoff" in out or "def retry" in out, False)
+check("extract-no-table", "|" in out, False)
+check("extract-has-outcome", "All 214 tests pass and the linter is clean." in out, True)
+check("extract-has-action", "You need to delete the old cron entries once you are confident." in out, True)
+check("extract-leads-with-outcome",
+      out.startswith("All three services are migrated and deployed."), True)
+
+# faithfulness: every emitted sentence is verbatim from the source candidates
+cands = set(kv._candidate_sentences(MD_MSG))
+import re as _re
+emitted = _re.split(r"(?<=[.!?])\s+", out)
+check("extract-faithful", all(sent in cands for sent in emitted), True)
+
+# document order is preserved
+idx = [next(i for i, c in enumerate(kv._candidate_sentences(MD_MSG)) if c == sent)
+       for sent in emitted]
+check("extract-in-order", idx == sorted(idx), True)
+
+# bullets become sentences
+check("extract-bullets-usable",
+      "Moved the auth middleware into a shared package." in cands, True)
+
+# filler lead is not chosen over real content when it carries no signal
+FILLER_MSG = ("Here's what I found after digging in. " * 1) + \
+    ("Padding sentence with no purpose here. " * 12) + \
+    "The deploy failed because the token expired. You should rotate it and rerun."
+fout = kv.summarize_local(FILLER_MSG)
+check("extract-skips-filler", fout.startswith("Here's what I found"), False)
+check("extract-finds-failure", "The deploy failed because the token expired." in fout, True)
+
+# degenerate input -> None (caller falls back to truncation)
+check("extract-empty-none", kv.summarize_local("###\n| a | b |\n```x```"), None)
 
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
